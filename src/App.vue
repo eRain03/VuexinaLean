@@ -1,61 +1,161 @@
 <template>
   <div class="layout-container">
-    <div class="left-panel card-box">
-      <KLineChart :data="klineList" />
+
+    <div class="control-bar">
+      <div class="control-group">
+        <span class="label">Symbol:</span>
+        <button
+            v-for="sym in supportedSymbols"
+            :key="sym"
+            :class="['ctrl-btn', { active: currentSymbol === sym }]"
+            @click="switchSymbol(sym)"
+        >
+          {{ sym }}
+        </button>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="control-group">
+        <span class="label">Time:</span>
+        <button
+            v-for="intv in supportedIntervals"
+            :key="intv"
+            :class="['ctrl-btn', { active: currentInterval === intv }]"
+            @click="switchInterval(intv)"
+        >
+          {{ intv }}
+        </button>
+      </div>
     </div>
-    <div class="right-panel card-box">
-      <OrderBook :asks="orderBook.asks" :bids="orderBook.bids" />
+
+    <div class="main-content">
+      <div class="left-panel card-box">
+        <KLineChart :data="klineList" :key="currentSymbol + currentInterval" />
+      </div>
+      <div class="right-panel card-box">
+        <OrderBook :asks="orderBook.asks" :bids="orderBook.bids" />
+      </div>
     </div>
+
   </div>
 </template>
 
 <script setup>
-// JS 代码逻辑部分完全不变
 import { ref, onMounted, onUnmounted } from 'vue';
 import KLineChart from './components/KLineChart.vue';
 import OrderBook from './components/OrderBook.vue';
 import { fetchHistoryCandles, loadHistoryFromLS, saveHistoryToLS, connectWebSocket } from './services/binanceService';
 
+// --- 配置项 ---
+const supportedSymbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'DOGE/USDT'];
+const supportedIntervals = ['1m', '15m', '1h', '4h', '1d'];
+
+// --- 状态定义 ---
+const currentSymbol = ref('BTC/USDT');
+const currentInterval = ref('1m');
+
 const klineList = ref([]);
 const orderBook = ref({ asks: [], bids: [] });
 let ws = null;
 
-const onKlineUpdate = (candle, isClosed) => {
-  if (klineList.value.length === 0) { klineList.value.push(candle); return; }
-  const last = klineList.value[klineList.value.length - 1];
-  if (candle[0] > last[0]) {
-    klineList.value.push(candle);
-    if (klineList.value.length > 500) klineList.value.shift();
-  } else {
-    klineList.value[klineList.value.length - 1] = candle;
+// --- 核心逻辑：初始化/重置数据 ---
+const initData = async () => {
+  // 1. 清理旧连接和数据
+  if (ws) {
+    ws.close();
+    ws = null;
   }
-  if (isClosed) saveHistoryToLS(klineList.value);
-};
+  klineList.value = [];
+  orderBook.value = { asks: [], bids: [] };
 
-const onDepthUpdate = (data) => { orderBook.value = data; };
+  const sym = currentSymbol.value;
+  const intv = currentInterval.value;
 
-onMounted(async () => {
-  const cached = loadHistoryFromLS();
-  if (cached && cached.length) klineList.value = cached;
-  const history = await fetchHistoryCandles();
+  // 2. 尝试加载缓存
+  const cached = loadHistoryFromLS(sym, intv);
+  if (cached && cached.length) {
+    klineList.value = cached;
+  }
+
+  // 3. 拉取最新历史数据
+  const history = await fetchHistoryCandles(sym, intv);
   if (history && history.length) {
     klineList.value = history;
-    saveHistoryToLS(history);
+    saveHistoryToLS(history, sym, intv);
   }
-  ws = connectWebSocket(onKlineUpdate, onDepthUpdate);
+
+  // 4. 建立 WebSocket 连接
+  // 回调函数需要使用当前的 sym 和 intv 上下文
+  ws = connectWebSocket(
+      sym,
+      intv,
+      (candle, isClosed) => onKlineUpdate(candle, isClosed, sym, intv),
+      onDepthUpdate
+  );
+};
+
+// --- WebSocket 回调处理 ---
+const onKlineUpdate = (candle, isClosed, sym, intv) => {
+  // 防止旧 WS 的消息污染新状态 (双重保险)
+  if (sym !== currentSymbol.value || intv !== currentInterval.value) return;
+
+  if (klineList.value.length === 0) {
+    klineList.value.push(candle);
+    return;
+  }
+
+  const lastIndex = klineList.value.length - 1;
+  const lastCandle = klineList.value[lastIndex];
+
+  // 如果新K线时间 > 最后一根K线时间 -> 新增
+  if (candle[0] > lastCandle[0]) {
+    klineList.value.push(candle);
+    // 保持数据长度不过长
+    if (klineList.value.length > 500) klineList.value.shift();
+  } else {
+    // 否则 -> 更新当前这根
+    klineList.value[lastIndex] = candle;
+  }
+
+  if (isClosed) {
+    saveHistoryToLS(klineList.value, sym, intv);
+  }
+};
+
+const onDepthUpdate = (data) => {
+  orderBook.value = data;
+};
+
+// --- 切换事件 ---
+const switchSymbol = (sym) => {
+  if (currentSymbol.value === sym) return;
+  currentSymbol.value = sym;
+  initData(); // 重新初始化
+};
+
+const switchInterval = (intv) => {
+  if (currentInterval.value === intv) return;
+  currentInterval.value = intv;
+  initData(); // 重新初始化
+};
+
+// --- 生命周期 ---
+onMounted(() => {
+  initData();
 });
 
-onUnmounted(() => { if (ws) ws.close(); });
+onUnmounted(() => {
+  if (ws) ws.close();
+});
 </script>
 
 <style>
-/* 引入 Roboto Mono 字体 (可选，如果没有网络会自动回退) */
+/* 引入 Roboto Mono 字体 */
 @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500&display=swap');
 
-/* 全局重置 */
 body {
   margin: 0;
-  /* 全局背景色调深一点，让卡片浮现出来 */
   background: #0b0e11;
   color: #EAECEF;
   overflow: hidden;
@@ -64,32 +164,87 @@ body {
 
 .layout-container {
   display: flex;
+  flex-direction: column; /* 改为垂直布局，顶部放控制栏 */
   height: 100vh;
   width: 100vw;
-  /* 关键：增加内边距，让卡片不贴边 */
   padding: 16px;
   box-sizing: border-box;
-  /* 关键：增加卡片之间的间距 */
   gap: 16px;
 }
 
-/* 通用卡片样式 */
-.card-box {
-  /* 卡片背景色，比大背景稍浅 */
+/* 顶部控制栏样式 */
+.control-bar {
+  display: flex;
+  align-items: center;
   background: #171b26;
-  /* 圆角 */
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid #232733;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+  min-height: 40px;
+}
+
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.divider {
+  width: 1px;
+  height: 20px;
+  background: #2B2F3B;
+  margin: 0 16px;
+}
+
+.label {
+  color: #616876;
+  font-size: 12px;
+  margin-right: 4px;
+  font-weight: 600;
+}
+
+.ctrl-btn {
+  background: transparent;
+  border: 1px solid transparent; /* 预留边框防止抖动 */
+  color: #848E9C;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-weight: 500;
+}
+
+.ctrl-btn:hover {
+  color: #EAECEF;
+  background: #2B2F3B;
+}
+
+.ctrl-btn.active {
+  color: #171b26;
+  background: #F0B90B; /* 币安黄 */
+  font-weight: bold;
+}
+
+/* 主内容区域，包含图表和盘口 */
+.main-content {
+  display: flex;
+  flex: 1; /* 占据剩余高度 */
+  gap: 16px;
+  min-height: 0; /* 防止 flex 子项溢出 */
+}
+
+.card-box {
+  background: #171b26;
   border-radius: 12px;
-  /* 柔和的阴影，增加立体感 */
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-  /* 确保内部内容不会溢出圆角 */
   overflow: hidden;
-  /* 加上一个极细微的边框，增加精致感 */
   border: 1px solid #232733;
 }
 
 .left-panel {
   flex: 3;
-  /* K线图卡片增加一点内边距，让图表呼吸 */
   padding: 10px;
   display: flex;
   flex-direction: column;
@@ -97,6 +252,5 @@ body {
 
 .right-panel {
   flex: 1;
-  /* 深度图不需要内边距，因为它自己内部处理好了 */
 }
 </style>

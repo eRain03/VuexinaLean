@@ -1,23 +1,20 @@
 /*
  * 文件名: src/services/binanceService.js
- * 作用: 数据层封装 (稳定版)。
- * 1. [关键修改] 历史数据：放弃 CCXT，改用原生 fetch 请求本地代理，彻底解决 500 报错。
- * 2. 实时数据：使用原生 WebSocket 连接。
- * 3. 缓存：管理 LocalStorage。
+ * 作用: 数据层封装 (动态版)。
+ * 修改点: 移除了顶部硬编码的常量，所有函数都增加了 symbol 和 interval 参数。
  */
 
-// 常量定义
-const SYMBOL = 'BTC/USDT';
-const TIMEFRAME = '1m';
 const LIMIT = 500;
-const LS_KEY = `kline_data_${SYMBOL}_${TIMEFRAME}`;
+
+// 辅助函数：生成缓存 Key
+const getLsKey = (symbol, interval) => `kline_data_${symbol}_${interval}`;
 
 /**
  * 1. 从 LocalStorage 获取缓存数据
- * 用于页面秒开，避免等待 API 请求
  */
-export function loadHistoryFromLS() {
-    const raw = localStorage.getItem(LS_KEY);
+export function loadHistoryFromLS(symbol, interval) {
+    const key = getLsKey(symbol, interval);
+    const raw = localStorage.getItem(key);
     if (raw) {
         try {
             return JSON.parse(raw);
@@ -31,30 +28,26 @@ export function loadHistoryFromLS() {
 
 /**
  * 2. 保存数据到 LocalStorage
- * @param {Array} data - K线数据数组
  */
-export function saveHistoryToLS(data) {
+export function saveHistoryToLS(data, symbol, interval) {
     if (!data || data.length === 0) return;
-    // 只保存最近 LIMIT 条，防止 LocalStorage 溢出
+    const key = getLsKey(symbol, interval);
+    // 只保存最近 LIMIT 条
     const dataToSave = data.slice(-LIMIT);
-    localStorage.setItem(LS_KEY, JSON.stringify(dataToSave));
+    localStorage.setItem(key, JSON.stringify(dataToSave));
 }
 
 /**
- * 3. [核心修复] 获取历史 K 线数据
- * 之前的 CCXT 报错是因为它尝试获取交易所信息失败。
- * 这里改为直接请求本地代理接口，绕过 CCXT 检查，稳定可靠。
+ * 3. 获取历史 K 线数据 (支持动态币种和周期)
  */
-export async function fetchHistoryCandles() {
+export async function fetchHistoryCandles(symbol, interval) {
     try {
         // 构造请求参数
-        // 我们请求本地 /api/api/v3/klines，Vite 会将其代理到 binance
-        const symbolClean = SYMBOL.replace('/', ''); // BTCUSDT
-        const url = `/api/api/v3/klines?symbol=${symbolClean}&interval=${TIMEFRAME}&limit=${LIMIT}`;
+        const symbolClean = symbol.replace('/', ''); // BTC/USDT -> BTCUSDT
+        const url = `/api/api/v3/klines?symbol=${symbolClean}&interval=${interval}&limit=${LIMIT}`;
 
-        console.log('[REST] 正在请求历史数据:', url);
+        console.log(`[REST] 正在请求 ${symbol} ${interval} 历史数据...`);
 
-        // 使用原生 fetch
         const response = await fetch(url);
 
         if (!response.ok) {
@@ -63,11 +56,9 @@ export async function fetchHistoryCandles() {
 
         const rawData = await response.json();
 
-        // Binance API 返回的是字符串数组，需要转换为数字
-        // 原始格式: [ [t, o, h, l, c, v, ...], ... ]
         const formattedData = rawData.map(item => {
             return [
-                item[0],                // Timestamp (无需转换)
+                item[0],                // Timestamp
                 parseFloat(item[1]),    // Open
                 parseFloat(item[2]),    // High
                 parseFloat(item[3]),    // Low
@@ -76,29 +67,29 @@ export async function fetchHistoryCandles() {
             ];
         });
 
-        console.log(`[REST] 成功拉取 ${formattedData.length} 条 K 线`);
+        console.log(`[REST] 成功拉取 ${formattedData.length} 条数据`);
         return formattedData;
 
     } catch (error) {
-        console.error('拉取历史数据失败。请检查：1.VPN是否开启 2.Vite Proxy配置是否正确。', error);
+        console.error('拉取历史数据失败', error);
         return [];
     }
 }
 
 /**
- * 4. 建立 WebSocket 连接监听 K 线和深度
- * 保持不变，这部分逻辑是正确的。
+ * 4. 建立 WebSocket 连接 (支持动态订阅)
  */
-export function connectWebSocket(onKlineUpdate, onDepthUpdate) {
-    const symbolLower = SYMBOL.replace('/', '').toLowerCase();
+export function connectWebSocket(symbol, interval, onKlineUpdate, onDepthUpdate) {
+    const symbolLower = symbol.replace('/', '').toLowerCase(); // btc/usdt -> btcusdt
 
-    // 订阅 K线 (kline_1m) 和 20档深度 (depth20)
-    const wsUrl = `wss://stream.binance.com:9443/stream?streams=${symbolLower}@kline_${TIMEFRAME}/${symbolLower}@depth20`;
+    // 订阅 K线 和 深度
+    const wsUrl = `wss://stream.binance.com:9443/stream?streams=${symbolLower}@kline_${interval}/${symbolLower}@depth20`;
 
+    console.log(`[WS] 正在连接: ${wsUrl}`);
     const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-        console.log('Binance WebSocket 已连接');
+        console.log(`[WS] ${symbol} 连接成功`);
     };
 
     ws.onmessage = (event) => {
@@ -107,7 +98,7 @@ export function connectWebSocket(onKlineUpdate, onDepthUpdate) {
             const stream = message.stream;
             const data = message.data;
 
-            // --- 处理 K 线数据 ---
+            // --- 处理 K 线 ---
             if (stream.includes('kline')) {
                 const k = data.k;
                 const candle = [
@@ -118,10 +109,9 @@ export function connectWebSocket(onKlineUpdate, onDepthUpdate) {
                     parseFloat(k.c), // Close
                     parseFloat(k.v)  // Volume
                 ];
-                // k.x 为 true 代表这根 K 线走完闭合了
                 onKlineUpdate(candle, k.x);
             }
-            // --- 处理深度数据 ---
+            // --- 处理深度 ---
             else if (stream.includes('depth')) {
                 onDepthUpdate({
                     bids: data.bids,
@@ -138,7 +128,7 @@ export function connectWebSocket(onKlineUpdate, onDepthUpdate) {
     };
 
     ws.onclose = () => {
-        console.log('WebSocket 已断开');
+        console.log(`[WS] ${symbol} 连接已断开`);
     };
 
     return ws;
